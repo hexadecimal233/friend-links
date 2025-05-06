@@ -1,106 +1,110 @@
 import { Octokit } from "octokit";
 import fs from "fs";
-import { Web } from "./Web.js";
+import { UserGraph } from "./usergraph.js";
 
 const GITHUB_TOKEN = fs.readFileSync("./token.txt").toString();
 const MAIN_USER = "hexadecimal233";
 const MAX_FOLLOWING = 500;
 
-const NOPE = '{"nope":true}';
-
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
-// Get following usernames
-async function getFollowings(username: string): Promise<string[]> {
-  // Read cahce if available
+async function getFollowings(
+  username: string,
+  ignoreLimit: boolean = false
+): Promise<string[]> {
   let cacheName = `./cache/${username}.json`;
-
-  let followings = [];
 
   if (fs.existsSync(cacheName)) {
     let strings = fs.readFileSync(cacheName, "utf-8");
-    if (strings == NOPE) {
+    const followings = JSON.parse(strings);
+    if (followings.length === 0) {
       console.debug(`${username} has no following users, skipping.`);
       return [];
     }
-
-    followings = JSON.parse(strings);
     console.debug(
-      `Get ${username}'s follwoings from cache: ${followings.length} followings`
+      `Get ${username}'s followings from disk cache: ${followings.length}`
     );
-  } else {
-    // Get current user data
-    let userData = (
-      await octokit.rest.users.getByUsername({
-        username: username,
-      })
-    ).data;
+    return followings;
+  }
 
-    // Skip users w/o follwings or too many followers
-    if (userData.following == 0 || userData.following >= MAX_FOLLOWING) {
+  try {
+    // 获取当前用户数据
+    const userData = (await octokit.rest.users.getByUsername({ username }))
+      .data;
+
+    // 跳过无关注或关注数过多的用户
+    if (
+      userData.following === 0 ||
+      (userData.following >= MAX_FOLLOWING && !ignoreLimit)
+    ) {
       console.debug(
         `${username} has ${
           userData.following >= MAX_FOLLOWING ? "too many" : "no"
         } following users, skipping.`
       );
-      fs.writeFile(cacheName, '{"nope":true}', () => {});
-    } else {
-      // Add follower data to username array
-      let pagesMax = Math.ceil(userData.following / 100);
+      fs.writeFileSync(cacheName, "[]");
+      return [];
+    }
 
-      for (let i = 1; i <= pagesMax; i++) {
-        let followerData = (
-          await octokit.rest.users.listFollowingForUser({
-            username: username,
-            per_page: 100,
-            page: i,
-          })
-        ).data;
-        followerData.map((user) => {
-          followings.push(user.login);
-        });
+    // 分页获取关注列表
+    const followings: string[] = [];
+    const pagesMax = Math.ceil(userData.following / 100);
 
-        console.debug(
-          `Getting ${username}'s follwoings: ${i}/${pagesMax} pages`
-        );
-      }
+    for (let i = 1; i <= pagesMax; i++) {
+      const followerData = (
+        await octokit.rest.users.listFollowingForUser({
+          username,
+          per_page: 100,
+          page: i,
+        })
+      ).data;
 
-      // Save cache and return
-      fs.writeFile(cacheName, JSON.stringify(followings), () => {});
+      followings.push(...followerData.map((user) => user.login));
+      console.debug(`Getting ${username}'s followings: ${i}/${pagesMax} pages`);
+    }
 
-      console.debug(
-        `Get ${username}'s follwoings: ${userData.following} followings`
-      );
+    // 缓存到磁盘和内存
+    fs.writeFileSync(cacheName, JSON.stringify(followings));
+
+    console.debug(
+      `Get ${username}'s followings: ${userData.following} followings`
+    );
+
+    return followings;
+  } catch (error: any) {
+    console.error(`Failed to fetch followings for ${username}:`, error.message);
+    return [];
+  }
+}
+
+// 主函数
+(async () => {
+  if (!fs.existsSync("./cache")) fs.mkdirSync("./cache");
+
+  const mainFollowings = await getFollowings(MAIN_USER, true);
+  const allUsers = new UserGraph();
+  allUsers.nodes.set(MAIN_USER, mainFollowings);
+
+  console.log(
+    `At most ${
+      mainFollowings.length * 5
+    } API points will be used (Assuming every user have 500 followers). Watch out! -- You only have 5000 points.`
+  );
+
+  for (let user of mainFollowings) {
+    const followings = await getFollowings(user);
+    if (followings.length > 0) {
+      allUsers.nodes.set(user, followings);
     }
   }
 
-  return followings;
-}
+  console.log(`已加载 ${allUsers.nodes.size}/${mainFollowings.length}!`);
 
-let mainFollowings = await getFollowings(MAIN_USER);
-let allUsers = new Web();
-allUsers.nodes.set(MAIN_USER, mainFollowings);
-
-console.log(
-  `At most ${
-    mainFollowings.length * 5
-  } API points will be used (Assuming every user have 500 followers). Watch out! -- You only have 5000 points.`
-);
-
-for (let user of mainFollowings) {
-  let followings = await getFollowings(user);
-  if (followings.length != 0) {
-    allUsers.nodes.set(user, followings);
+  let mutuals = "";
+  for (const [p1, p2] of allUsers.getMutualLinks()) {
+    mutuals += `${p1} <=> ${p2}\n`;
   }
-}
 
-console.log(`${allUsers.nodes.size}/${mainFollowings.length} users loaded!`);
-
-let output = "互关的人：";
-for (const [p1, p2] of allUsers.getMutualLinks().pairs) {
-  output += `${p1} <=> ${p2}\n`;
-}
-
-fs.writeFileSync("./result.txt", output);
-
-console.log('Mutual followers saved to "result.txt".');
+  fs.writeFileSync("./result.txt", "互关的人：\n" + mutuals);
+  console.log('互关用户已经保存至"result.txt"');
+})();
